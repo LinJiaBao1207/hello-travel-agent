@@ -14,6 +14,7 @@
       </div>
       <h1 class="page-title">智能旅行助手</h1>
       <p class="page-subtitle">基于AI的个性化旅行规划,让每一次出行都完美无忧</p>
+      <a-button class="history-entry" @click="goHistory">📚 查看历史规划</a-button>
     </div>
 
     <a-card class="form-card" :bordered="false">
@@ -209,6 +210,7 @@ import { useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { generateTripPlan } from '@/services/api'
 import type { TripFormData } from '@/types'
+import { saveTripToHistory } from '@/services/history'
 import type { Dayjs } from 'dayjs'
 
 const router = useRouter()
@@ -242,6 +244,10 @@ watch([() => formData.start_date, () => formData.end_date], ([start, end]) => {
     }
   }
 })
+
+const goHistory = () => {
+  router.push('/history')
+}
 
 const handleSubmit = async () => {
   if (!formData.start_date || !formData.end_date) {
@@ -290,8 +296,9 @@ const handleSubmit = async () => {
     loadingStatus.value = '✅ 完成!'
 
     if (response.success && response.data) {
-      // 保存到sessionStorage
+      // 保存到sessionStorage与历史记录
       sessionStorage.setItem('tripPlan', JSON.stringify(response.data))
+      saveTripToHistory(response.data, requestData)
 
       message.success('旅行计划生成成功!')
 
@@ -645,5 +652,13 @@ const handleSubmit = async () => {
     transform: translateY(0);
   }
 }
-</style>
 
+
+.history-entry {
+  margin-top: 16px;
+  border-radius: 20px;
+  border: 1px solid rgba(255, 255, 255, 0.5);
+  background: rgba(255, 255, 255, 0.2);
+  color: #fff;
+}
+</style>

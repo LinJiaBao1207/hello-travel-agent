@@ -9,7 +9,10 @@
         <a-button v-if="!editMode" @click="toggleEditMode" type="default">
           ✏️ 编辑行程
         </a-button>
-        <a-button v-else @click="saveChanges" type="primary">
+        <a-button @click="goHistory" type="default">
+          📚 历史记录
+        </a-button>
+        <a-button v-if="editMode" @click="saveChanges" type="primary">
           💾 保存修改
         </a-button>
         <a-button v-if="editMode" @click="cancelEdit" type="default">
@@ -309,30 +312,56 @@
 
 <script setup lang="ts">
 import { ref, onMounted, nextTick } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { message } from 'ant-design-vue'
 import { DownOutlined } from '@ant-design/icons-vue'
 import AMapLoader from '@amap/amap-jsapi-loader'
 import html2canvas from 'html2canvas'
 import jsPDF from 'jspdf'
 import type { TripPlan } from '@/types'
+import {
+  getActiveHistoryId,
+  getTripHistoryById,
+  saveTripToHistory,
+  setActiveHistoryId,
+  updateTripHistory
+} from '@/services/history'
 
 const router = useRouter()
+const route = useRoute()
 const tripPlan = ref<TripPlan | null>(null)
 const editMode = ref(false)
 const originalPlan = ref<TripPlan | null>(null)
 const attractionPhotos = ref<Record<string, string>>({})
 const activeSection = ref('overview')
 const activeDays = ref<number[]>([0]) // 默认展开第一天
+const activeHistoryId = ref<string | null>(null)
 let map: any = null
 
 onMounted(async () => {
-  const data = sessionStorage.getItem('tripPlan')
-  if (data) {
-    tripPlan.value = JSON.parse(data)
-    // 加载景点图片
+  const queryId = typeof route.query.historyId === 'string' ? route.query.historyId : null
+  const sessionId = getActiveHistoryId()
+  activeHistoryId.value = queryId || sessionId
+
+  if (activeHistoryId.value) {
+    setActiveHistoryId(activeHistoryId.value)
+
+    const historyItem = getTripHistoryById(activeHistoryId.value)
+    if (historyItem) {
+      tripPlan.value = historyItem.data
+      sessionStorage.setItem('tripPlan', JSON.stringify(historyItem.data))
+    }
+  }
+
+  if (!tripPlan.value) {
+    const data = sessionStorage.getItem('tripPlan')
+    if (data) {
+      tripPlan.value = JSON.parse(data)
+    }
+  }
+
+  if (tripPlan.value) {
     await loadAttractionPhotos()
-    // 等待DOM渲染完成后初始化地图
     await nextTick()
     initMap()
   }
@@ -340,6 +369,10 @@ onMounted(async () => {
 
 const goBack = () => {
   router.push('/')
+}
+
+const goHistory = () => {
+  router.push('/history')
 }
 
 // 滚动到指定区域
@@ -362,9 +395,17 @@ const toggleEditMode = () => {
 // 保存修改
 const saveChanges = () => {
   editMode.value = false
-  // 更新sessionStorage
+  // 更新sessionStorage与历史记录
   if (tripPlan.value) {
     sessionStorage.setItem('tripPlan', JSON.stringify(tripPlan.value))
+
+    if (activeHistoryId.value) {
+      updateTripHistory(activeHistoryId.value, tripPlan.value)
+    } else {
+      const created = saveTripToHistory(tripPlan.value)
+      activeHistoryId.value = created.id
+      setActiveHistoryId(created.id)
+    }
   }
   message.success('修改已保存')
 
@@ -838,10 +879,38 @@ const initMap = async () => {
       plugins: ['AMap.Marker', 'AMap.Polyline', 'AMap.InfoWindow']
     })
 
+    // 计算中心点:从景点坐标计算
+    let centerLng = 116.397128  // 默认北京
+    let centerLat = 39.916527
+    
+    if (tripPlan.value && tripPlan.value.days && tripPlan.value.days.length > 0) {
+      let totalLng = 0
+      let totalLat = 0
+      let count = 0
+      
+      tripPlan.value.days.forEach(day => {
+        if (day.attractions && day.attractions.length > 0) {
+          day.attractions.forEach(attr => {
+            if (attr.location && attr.location.longitude && attr.location.latitude) {
+              totalLng += attr.location.longitude
+              totalLat += attr.location.latitude
+              count++
+            }
+          })
+        }
+      })
+      
+      // 计算平均值作为中心点
+      if (count > 0) {
+        centerLng = totalLng / count
+        centerLat = totalLat / count
+      }
+    }
+
     // 创建地图实例
     map = new AMap.Map('amap-container', {
       zoom: 12,
-      center: [116.397128, 39.916527], // 默认中心点(北京)
+      center: [centerLng, centerLat], // 根据景点计算的中心点
       viewMode: '3D'
     })
 
