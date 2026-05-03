@@ -93,3 +93,17 @@ export interface TripPlanResponse {
   data?: TripPlan
 }
 
+
+export interface TripHistoryItem {
+  id: string
+  createdAt: string
+  updatedAt: string
+  city: string
+  start_date: string
+  end_date: string
+  travel_days: number
+  preferences: string[]
+  transportation: string
+  accommodation: string
+  data: TripPlan
+}
