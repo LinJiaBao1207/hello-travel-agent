@@ -1,50 +1,15 @@
-"""高德地图MCP服务封装"""
+"""高德地图服务封装 - 直接 HTTP API 实现"""
 
-from typing import List, Dict, Any, Optional
-from hello_agents.tools import MCPTool
+import json
+from typing import List, Dict, Any, Optional, Tuple
+
+import httpx
+
 from ..config import get_settings
 from ..models.schemas import Location, POIInfo, WeatherInfo
 
-# 全局MCP工具实例
-_amap_mcp_tool = None
 
-
-def get_amap_mcp_tool() -> MCPTool:
-    """
-    获取高德地图MCP工具实例(单例模式)
-    
-    Returns:
-        MCPTool实例
-    """
-    global _amap_mcp_tool
-    
-    if _amap_mcp_tool is None:
-        settings = get_settings()
-        
-        if not settings.amap_api_key:
-            raise ValueError("高德地图API Key未配置,请在.env文件中设置AMAP_API_KEY")
-        
-        # 创建MCP工具
-        _amap_mcp_tool = MCPTool(
-            name="amap",
-            description="高德地图服务,支持POI搜索、路线规划、天气查询等功能",
-            server_command=["uvx", "amap-mcp-server"],
-            env={"AMAP_MAPS_API_KEY": settings.amap_api_key},
-            auto_expand=True  # 自动展开为独立工具
-        )
-        
-        print(f"✅ 高德地图MCP工具初始化成功")
-        print(f"   工具数量: {len(_amap_mcp_tool._available_tools)}")
-        
-        # 打印可用工具列表
-        if _amap_mcp_tool._available_tools:
-            print("   可用工具:")
-            for tool in _amap_mcp_tool._available_tools[:5]:  # 只打印前5个
-                print(f"     - {tool.get('name', 'unknown')}")
-            if len(_amap_mcp_tool._available_tools) > 5:
-                print(f"     ... 还有 {len(_amap_mcp_tool._available_tools) - 5} 个工具")
-    
-    return _amap_mcp_tool
+AMAP_API_BASE = "https://restapi.amap.com"
 
 
 class AmapService:
@@ -52,7 +17,31 @@ class AmapService:
     
     def __init__(self):
         """初始化服务"""
-        self.mcp_tool = get_amap_mcp_tool()
+        settings = get_settings()
+        if not settings.amap_api_key:
+            raise ValueError("高德地图API Key未配置,请在.env文件中设置AMAP_API_KEY")
+        self.api_key = settings.amap_api_key
+
+    def _request(self, path: str, params: Dict[str, Any]) -> Dict[str, Any]:
+        """发送 HTTP 请求到高德 API"""
+        request_params = {**params, "key": self.api_key, "output": "JSON"}
+        response = httpx.get(f"{AMAP_API_BASE}{path}", params=request_params, timeout=20.0)
+        response.raise_for_status()
+        data = response.json()
+        if data.get("status") not in {"1", 1, True}:
+            raise ValueError(data.get("info", "高德地图接口返回失败"))
+        return data
+
+    @staticmethod
+    def _parse_location(location_str: str) -> Optional[Location]:
+        """从经纬度字符串解析成 Location 对象"""
+        if not location_str:
+            return None
+        try:
+            longitude, latitude = location_str.split(",")
+            return Location(longitude=float(longitude), latitude=float(latitude))
+        except Exception:
+            return None
     
     def search_poi(self, keywords: str, city: str, citylimit: bool = True) -> List[POIInfo]:
         """
@@ -67,25 +56,49 @@ class AmapService:
             POI信息列表
         """
         try:
-            # 调用MCP工具
-            result = self.mcp_tool.run({
-                "action": "call_tool",
-                "tool_name": "maps_text_search",
-                "arguments": {
+            data = self._request(
+                "/v3/place/text",
+                {
                     "keywords": keywords,
                     "city": city,
-                    "citylimit": str(citylimit).lower()
-                }
-            })
-            
-            # 解析结果
-            # 注意: MCP工具返回的是字符串,需要解析
-            # 这里简化处理,实际应该解析JSON
-            print(f"POI搜索结果: {result[:200]}...")  # 打印前200字符
-            
-            # TODO: 解析实际的POI数据
-            return []
-            
+                    "citylimit": str(citylimit).lower(),
+                },
+            )
+
+            pois: List[POIInfo] = []
+            for item in data.get("pois", [])[:10]:
+                location = self._parse_location(item.get("location", ""))
+                if not location:
+                    continue
+                
+                # 处理 tel 字段 - 高德 API 返回的可能是列表或字符串
+                tel = item.get("tel")
+                if isinstance(tel, list):
+                    tel = tel[0] if tel else None
+                elif not isinstance(tel, str):
+                    tel = None
+                
+                pois.append(
+                    POIInfo(
+                        id=item.get("id", ""),
+                        name=item.get("name", ""),
+                        type=item.get("type", ""),
+                        address=item.get("address", ""),
+                        location=location,
+                        tel=tel,
+                    )
+                )
+
+            # 详细日志
+            print(f"✅ POI搜索结果: 成功解析 {len(pois)} 个POI")
+            for i, poi in enumerate(pois[:3], 1):
+                print(f"   {i}. {poi.name}")
+                print(f"      地址: {poi.address}")
+                print(f"      坐标: ({poi.location.longitude}, {poi.location.latitude})")
+            if len(pois) > 3:
+                print(f"   ... 还有 {len(pois)-3} 个POI")
+            return pois
+
         except Exception as e:
             print(f"❌ POI搜索失败: {str(e)}")
             return []
@@ -101,24 +114,58 @@ class AmapService:
             天气信息列表
         """
         try:
-            # 调用MCP工具
-            result = self.mcp_tool.run({
-                "action": "call_tool",
-                "tool_name": "maps_weather",
-                "arguments": {
-                    "city": city
-                }
-            })
+            # 先地理编码获取城市代码
+            _, adcode = self._geocode_meta(city)
+            weather_query = adcode or city
             
-            print(f"天气查询结果: {result[:200]}...")
-            
-            # TODO: 解析实际的天气数据
-            return []
-            
+            data = self._request(
+                "/v3/weather/weatherInfo",
+                {
+                    "city": weather_query,
+                    "extensions": "all",
+                },
+            )
+
+            weather_list: List[WeatherInfo] = []
+            forecasts = data.get("forecasts") or []
+            if forecasts:
+                casts = forecasts[0].get("casts", [])
+                for cast in casts:
+                    weather_list.append(
+                        WeatherInfo(
+                            date=cast.get("date", ""),
+                            day_weather=cast.get("dayweather", ""),
+                            night_weather=cast.get("nightweather", ""),
+                            day_temp=cast.get("daytemp", 0),
+                            night_temp=cast.get("nighttemp", 0),
+                            wind_direction=cast.get("daywind", ""),
+                            wind_power=cast.get("daypower", ""),
+                        )
+                    )
+
+            print(f"✅ 天气查询结果: 成功解析 {len(weather_list)} 天天气数据")
+            return weather_list
+
         except Exception as e:
             print(f"❌ 天气查询失败: {str(e)}")
             return []
     
+    def _geocode_meta(self, city: str) -> Tuple[Optional[Location], Optional[str]]:
+        """地理编码，获取坐标和行政区代码"""
+        try:
+            data = self._request(
+                "/v3/geocode/geo",
+                {"address": city},
+            )
+            geocodes = data.get("geocodes") or []
+            if not geocodes:
+                return None, None
+            first = geocodes[0]
+            return self._parse_location(first.get("location", "")), first.get("adcode")
+        except Exception as e:
+            print(f"⚠️ 地理编码失败: {str(e)}")
+            return None, None
+
     def plan_route(
         self,
         origin_address: str,
@@ -141,46 +188,51 @@ class AmapService:
             路线信息
         """
         try:
-            # 根据路线类型选择工具
-            tool_map = {
-                "walking": "maps_direction_walking_by_address",
-                "driving": "maps_direction_driving_by_address",
-                "transit": "maps_direction_transit_integrated_by_address"
+            origin_location = self.geocode(origin_address, origin_city)
+            destination_location = self.geocode(destination_address, destination_city)
+            if not origin_location or not destination_location:
+                return {}
+
+            origin = f"{origin_location.longitude},{origin_location.latitude}"
+            destination = f"{destination_location.longitude},{destination_location.latitude}"
+
+            route_map = {
+                "walking": "/v3/direction/walking",
+                "driving": "/v3/direction/driving",
+                "transit": "/v3/direction/transit/integrated",
             }
-            
-            tool_name = tool_map.get(route_type, "maps_direction_walking_by_address")
-            
-            # 构建参数
-            arguments = {
-                "origin_address": origin_address,
-                "destination_address": destination_address
+            path = route_map.get(route_type, "/v3/direction/walking")
+            params: Dict[str, Any] = {"origin": origin, "destination": destination}
+            if origin_city:
+                params["city"] = origin_city
+            if destination_city:
+                params["cityd"] = destination_city
+
+            data = self._request(path, params)
+            route = data.get("route") or {}
+
+            distance = 0.0
+            duration = 0
+            if route_type == "walking" and route.get("paths"):
+                first = route["paths"][0]
+                distance = float(first.get("distance", 0) or 0)
+                duration = int(float(first.get("duration", 0) or 0))
+            elif route_type == "driving" and route.get("paths"):
+                first = route["paths"][0]
+                distance = float(first.get("distance", 0) or 0)
+                duration = int(float(first.get("duration", 0) or 0))
+            elif route_type == "transit" and route.get("transits"):
+                first = route["transits"][0]
+                distance = float(first.get("distance", 0) or 0)
+                duration = int(float(first.get("duration", 0) or 0))
+
+            return {
+                "distance": distance,
+                "duration": duration,
+                "route_type": route_type,
+                "description": f"{route_type}路线规划结果",
             }
-            
-            # 公共交通需要城市参数
-            if route_type == "transit":
-                if origin_city:
-                    arguments["origin_city"] = origin_city
-                if destination_city:
-                    arguments["destination_city"] = destination_city
-            else:
-                # 其他路线类型也可以提供城市参数提高准确性
-                if origin_city:
-                    arguments["origin_city"] = origin_city
-                if destination_city:
-                    arguments["destination_city"] = destination_city
-            
-            # 调用MCP工具
-            result = self.mcp_tool.run({
-                "action": "call_tool",
-                "tool_name": tool_name,
-                "arguments": arguments
-            })
-            
-            print(f"路线规划结果: {result[:200]}...")
-            
-            # TODO: 解析实际的路线数据
-            return {}
-            
+
         except Exception as e:
             print(f"❌ 路线规划失败: {str(e)}")
             return {}
@@ -197,20 +249,14 @@ class AmapService:
             经纬度坐标
         """
         try:
-            arguments = {"address": address}
+            params: Dict[str, Any] = {"address": address}
             if city:
-                arguments["city"] = city
-
-            result = self.mcp_tool.run({
-                "action": "call_tool",
-                "tool_name": "maps_geo",
-                "arguments": arguments
-            })
-
-            print(f"地理编码结果: {result[:200]}...")
-
-            # TODO: 解析实际的坐标数据
-            return None
+                params["city"] = city
+            data = self._request("/v3/geocode/geo", params)
+            geocodes = data.get("geocodes") or []
+            if not geocodes:
+                return None
+            return self._parse_location(geocodes[0].get("location", ""))
 
         except Exception as e:
             print(f"❌ 地理编码失败: {str(e)}")
@@ -227,31 +273,15 @@ class AmapService:
             POI详情信息
         """
         try:
-            result = self.mcp_tool.run({
-                "action": "call_tool",
-                "tool_name": "maps_search_detail",
-                "arguments": {
-                    "id": poi_id
-                }
-            })
-
-            print(f"POI详情结果: {result[:200]}...")
-
-            # 解析结果并提取图片
-            import json
-            import re
-
-            # 尝试从结果中提取JSON
-            json_match = re.search(r'\{.*\}', result, re.DOTALL)
-            if json_match:
-                data = json.loads(json_match.group())
-                return data
-
-            return {"raw": result}
+            data = self._request(
+                "/v5/place/detail",
+                {"id": poi_id},
+            )
+            return data
 
         except Exception as e:
             print(f"❌ 获取POI详情失败: {str(e)}")
-            return {}
+            return {"id": poi_id, "error": str(e)}
 
 
 # 创建全局服务实例
